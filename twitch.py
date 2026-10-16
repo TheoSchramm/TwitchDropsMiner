@@ -1491,6 +1491,7 @@ class Twitch:
                         benefit_edges: list[JsonType] = []
                         for edge in drop_data["benefitEdges"] or []:
                             benefit: JsonType = dict(edge["benefit"])
+                            # filled in by _fetch_benefit_types below
                             benefit.setdefault("distributionType", "UNKNOWN")
                             benefit_edges.append({**edge, "benefit": benefit})
                         timed_drops.append({
@@ -1523,11 +1524,58 @@ class Twitch:
                         "timeBasedDrops": timed_drops,
                     }
         if discovered:
+            await self._fetch_benefit_types(discovered)
             logger.info(
                 f"Campaign discovery: found {len(discovered)} extra campaign(s) "
                 f"on {len(channels)} live channel(s)"
             )
         return discovered
+
+    async def _fetch_benefit_types(self, campaigns: dict[str, JsonType]) -> None:
+        """
+        AvailableDrops doesn't return the benefit distribution type, which is needed
+        to tell badges and emotes apart from other rewards. Fetch it with a custom query,
+        from one channel per campaign.
+        """
+        channel_ids: set[str] = {
+            campaign_data["allow"]["channels"][0]["id"] for campaign_data in campaigns.values()
+        }
+        type_ops: list[JsonType] = [
+            {
+                "operationName": "BenefitTypes",
+                "query": (
+                    "query BenefitTypes($channelID: ID!) { channel(id: $channelID) { id "
+                    "viewerDropCampaigns { id timeBasedDrops { id benefitEdges { "
+                    "benefit { id distributionType } } } } } }"
+                ),
+                "variables": {"channelID": channel_id},
+            }
+            for channel_id in channel_ids
+        ]
+        benefit_types: dict[str, str] = {}
+        try:
+            for ops_chunk in chunk(type_ops, 20):
+                response_list: list[JsonType] = await self.gql_request(ops_chunk)
+                for response_json in response_list:
+                    channel_info: JsonType | None = (response_json.get("data") or {}).get("channel")
+                    if channel_info is None:
+                        continue
+                    for campaign_data in channel_info["viewerDropCampaigns"] or []:
+                        for drop_data in campaign_data["timeBasedDrops"] or []:
+                            for edge in drop_data["benefitEdges"] or []:
+                                benefit_data: JsonType = edge["benefit"]
+                                benefit_types[benefit_data["id"]] = (
+                                    benefit_data["distributionType"]
+                                )
+        except GQLException:
+            logger.warning("Campaign discovery: unable to fetch the reward types")
+        for campaign_data in campaigns.values():
+            for drop_data in campaign_data["timeBasedDrops"]:
+                for edge in drop_data["benefitEdges"]:
+                    benefit_data = edge["benefit"]
+                    benefit_data["distributionType"] = benefit_types.get(
+                        benefit_data["id"], "UNKNOWN"
+                    )
 
     async def fetch_inventory(self) -> None:
         status_update = self.gui.status.update
@@ -1692,12 +1740,17 @@ class Twitch:
             )
         except GQLException as exc:
             raise MinerException(f"Game: {game.slug}") from exc
-        if "game" in response["data"]:
+        game_data: JsonType | None = response["data"].get("game")
+        if game_data is None:
+            # the slug derived from the game name doesn't match any game on Twitch
+            logger.warning(f"Game not found on Twitch: {game.name} (slug: {game.slug})")
+            return []
+        if game_data.get("streams") is not None:
             return [
                 Channel.from_directory(
                     self, stream_channel_data["node"], drops_enabled=drops_enabled
                 )
-                for stream_channel_data in response["data"]["game"]["streams"]["edges"]
+                for stream_channel_data in game_data["streams"]["edges"]
                 if stream_channel_data["node"]["broadcaster"] is not None
             ]
         return []
